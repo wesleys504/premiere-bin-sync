@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body {
+      margin: 0;
+      padding: 12px;
+      font-size: 12px;
+      color: var(--uxp-host-text-color, #ddd);
+      background: var(--uxp-host-background-color, #232323);
+    }
+    h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #999; margin: 14px 0 6px; font-weight: 600; }
+    .row { display: flex; gap: 6px; margin-bottom: 6px; }
+    button {
+      flex: 1;
+      padding: 7px 8px;
+      border: 1px solid #555;
+      border-radius: 4px;
+      background: #3a3a3a;
+      color: #eee;
+      font-size: 12px;
+    }
+    button.primary { background: #4b4bd6; border-color: #4b4bd6; color: #fff; }
+    button.small { flex: 0 0 auto; padding: 3px 8px; font-size: 11px; }
+    label { display: flex; align-items: center; gap: 6px; margin: 4px 0; color: #ccc; }
+    .link {
+      border: 1px solid #3c3c3c;
+      border-radius: 4px;
+      padding: 6px 8px;
+      margin-bottom: 6px;
+    }
+    .link .bin { font-weight: 600; color: #eee; }
+    .link .folder { color: #999; font-size: 11px; word-break: break-all; margin: 2px 0 6px; }
+    .empty { color: #888; font-style: italic; }
+    #log {
+      border: 1px solid #3c3c3c;
+      border-radius: 4px;
+      padding: 6px 8px;
+      height: 130px;
+      overflow-y: scroll;
+      font-family: Menlo, monospace;
+      font-size: 10.5px;
+      color: #bbb;
+    }
+    .ok { color: #7fd17f; }
+    .warn { color: #e6c35c; }
+    .err { color: #ef7b7b; }
+  </style>
+</head>
+<body>
+  <h2>Selected bin</h2>
+  <div class="row">
+    <button id="btnLink">Link Folder…</button>
+    <button id="btnSync" class="primary">Sync Selected Bin</button>
+  </div>
+  <div class="row">
+    <button id="btnUnlink">Unlink</button>
+    <button id="btnSyncAll">Sync All</button>
+  </div>
+  <label><input type="checkbox" id="optSubfolders" checked /> Mirror subfolders as sub-bins</label>
+
+  <h2>Linked bins in this project</h2>
+  <div id="links"><div class="empty">Open a project to see links.</div></div>
+
+  <h2>Activity</h2>
+  <div id="log"></div>
+
+  <script src="index.js"></script>
+</body>
+</html>
