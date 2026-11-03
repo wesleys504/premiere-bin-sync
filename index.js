@@ -71,6 +71,7 @@ async function scanProject(project) {
   const root = await project.getRootItem();
   const bins = new Map();
   const mediaPaths = new Set();
+  const clips = []; // { clip, path (normalized), raw }
   const queue = [{ folder: root, path: "" }];
   while (queue.length) {
     const { folder, path } = queue.shift();
@@ -87,12 +88,12 @@ async function scanProject(project) {
       if (clip) {
         try {
           const p = await clip.getMediaFilePath();
-          if (p) mediaPaths.add(normalize(p));
+          if (p) { mediaPaths.add(normalize(p)); clips.push({ clip, path: normalize(p), raw: p, name: item.name }); }
         } catch (e) { /* sequences etc. have no media path */ }
       }
     }
   }
-  return { root, bins, mediaPaths };
+  return { root, bins, mediaPaths, clips };
 }
 
 function normalize(p) {
@@ -191,8 +192,42 @@ async function onlyFinishedFiles(entries) {
   await new Promise((r) => setTimeout(r, STABILITY_WAIT_MS));
   const after = await Promise.all(entries.map(sizeOf));
   const ready = [], copying = [];
-  entries.forEach((e, i) => (before[i] === after[i] && after[i] > 0 ? ready : copying).push(e));
-  return { ready, copying };
+  const sizes = new Map();
+  entries.forEach((e, i) => {
+    sizes.set(e.nativePath, after[i]);
+    (before[i] === after[i] && after[i] > 0 ? ready : copying).push(e);
+  });
+  return { ready, copying, sizes };
+}
+
+// ---------- relinking helpers ----------
+function relOf(path, root) {
+  const p = normalize(path), r = normalize(root);
+  return p.startsWith(r + "/") ? p.slice(r.length + 1) : null;
+}
+function baseOf(p) { return String(p).split(/[\\/]/).pop().toLowerCase(); }
+
+async function isOffline(clip) {
+  try { return await clip.isOffline(); } catch (e) { return false; }
+}
+
+// Offline clips that used to live in this linked folder (under any name the folder/drive has had).
+async function offlineClipsFor(link, scan, roots) {
+  const out = [];
+  for (const c of scan.clips) {
+    let rel = null;
+    for (const r of roots) { rel = relOf(c.raw, r); if (rel) break; }
+    if (!rel) continue;
+    if (await isOffline(c.clip)) out.push({ ...c, rel });
+  }
+  return out;
+}
+
+async function relink(c, newPath) {
+  try {
+    if (c.clip.canChangeMediaPath && !(await c.clip.canChangeMediaPath())) return false;
+    return await c.clip.changeMediaFilePath(newPath, false);
+  } catch (e) { return false; }
 }
 
 // ---------- core actions ----------
@@ -202,32 +237,91 @@ async function syncLink(project, link, scan) {
   const folderEntry = await getLinkedFolderEntry(link);
   if (!folderEntry) { log(`Can't reach folder for "${bin.name}". Is the drive mounted?`, "err"); return 0; }
 
+  const root = folderEntry.nativePath;
+  link.pastRoots = Array.from(new Set([...(link.pastRoots || []), link.folderPath, root].filter(Boolean)));
+  if (normalize(root) !== normalize(link.folderPath)) log(`Folder is now at ${root} (was ${link.folderPath}).`, "warn");
+  link.folderPath = root;
+  link.sizes = link.sizes || {}; // relative path -> size in bytes, remembered at import
+
+  // Clips already in the project, by path relative to this folder (so a renamed drive still matches)
+  const knownRel = new Set();
+  for (const c of scan.clips) for (const r of link.pastRoots) { const rel = relOf(c.raw, r); if (rel) knownRel.add(rel); }
+
   const groups = await collectFiles(folderEntry, link.mirrorSubfolders !== false);
-  let imported = 0, copyingTotal = 0;
+  let imported = 0, relinked = 0, copyingTotal = 0;
+  const ambiguous = [];
+  let offline = null; // computed only if needed
 
   for (const group of groups) {
-    const fresh = group.files.filter((f) => !scan.mediaPaths.has(normalize(f.nativePath)));
+    const fresh = [];
+    for (const f of group.files) {
+      const rel = relOf(f.nativePath, root);
+      if (scan.mediaPaths.has(normalize(f.nativePath))) {
+        if (rel && link.sizes[rel] === undefined) link.sizes[rel] = await sizeOf(f); // fill in for older imports
+        continue;
+      }
+      // Same file, but the drive or folder above it was renamed: relink the offline clip.
+      if (rel && knownRel.has(rel)) {
+        offline = offline || await offlineClipsFor(link, scan, link.pastRoots);
+        const c = offline.find((o) => o.rel === rel && !o.used);
+        if (c && await relink(c, f.nativePath)) { c.used = true; relinked++; scan.mediaPaths.add(normalize(f.nativePath)); log(`Relinked ${c.name} → ${f.name}`, "ok"); }
+        continue; // never import a second copy of a file we already have
+      }
+      fresh.push(f);
+    }
     if (!fresh.length) continue;
-    const { ready, copying } = await onlyFinishedFiles(fresh);
+    const { ready, copying, sizes } = await onlyFinishedFiles(fresh);
     copyingTotal += copying.length;
     if (!ready.length) continue;
+
+    // A "new" file may really be an old clip that was renamed or moved in Finder.
+    offline = offline || await offlineClipsFor(link, scan, link.pastRoots);
+    const toImport = [];
+    for (const f of ready) {
+      const size = sizes.get(f.nativePath);
+      const ext = extOf(f.name);
+      let cands = offline.filter((o) => !o.used && extOf(o.rel) === ext && link.sizes[o.rel] !== undefined && link.sizes[o.rel] === size);
+      // moved but same name: only for clips imported before sizes were recorded (sizes tell different takes apart)
+      if (!cands.length) cands = offline.filter((o) => !o.used && link.sizes[o.rel] === undefined && baseOf(o.rel) === f.name.toLowerCase());
+      if (cands.length === 1) {
+        if (await relink(cands[0], f.nativePath)) {
+          cands[0].used = true; relinked++;
+          scan.mediaPaths.add(normalize(f.nativePath));
+          const rel = relOf(f.nativePath, root);
+          if (rel) { link.sizes[rel] = size; delete link.sizes[cands[0].rel]; }
+          log(`Relinked ${cands[0].name} → ${f.name}`, "ok");
+          continue;
+        }
+      } else if (cands.length > 1) {
+        ambiguous.push(`${f.name} could be ${cands.map((c) => c.name).join(" or ")}`);
+        continue; // don't guess, and don't import a duplicate
+      }
+      toImport.push(f);
+    }
+    if (!toImport.length) continue;
 
     let target = bin.folder;
     if (group.relDir) {
       for (const part of group.relDir.split("/")) target = await getOrCreateChildBin(project, target, part);
     }
-    const paths = ready.map((f) => f.nativePath);
+    const paths = toImport.map((f) => f.nativePath);
     const ok = await project.importFiles(paths, true, asProjectItem(target), false);
     if (ok) {
-      paths.forEach((p) => scan.mediaPaths.add(normalize(p)));
+      toImport.forEach((f) => {
+        scan.mediaPaths.add(normalize(f.nativePath));
+        const rel = relOf(f.nativePath, root);
+        if (rel) link.sizes[rel] = sizes.get(f.nativePath);
+      });
       imported += paths.length;
       log(`+${paths.length} → ${bin.name}${group.relDir ? "/" + group.relDir : ""}`, "ok");
     } else {
       log(`Premiere refused some files in ${group.relDir || bin.name} (unsupported format?).`, "warn");
     }
   }
+  for (const a of ambiguous) log(`Not sure which clip to relink: ${a}. Relink it by hand in Premiere.`, "warn");
   if (copyingTotal) log(`${copyingTotal} file(s) still copying — sync again when they finish.`, "warn");
-  if (!imported && !copyingTotal) log(`"${bin.name}" is already up to date.`);
+  if (relinked) log(`Relinked ${relinked} clip(s) instead of importing duplicates.`, "ok");
+  if (!imported && !relinked && !copyingTotal && !ambiguous.length) log(`"${bin.name}" is already up to date.`);
   link.lastSync = Date.now();
   return imported;
 }
